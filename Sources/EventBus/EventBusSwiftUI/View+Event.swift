@@ -1,12 +1,15 @@
 import SwiftUI
 
-// MARK: - View Event
+// MARK: - View Extensions
 
 public extension View {
 
     /// Listens for events of type `T` and calls `perform` on the main actor.
-    /// The stream is automatically cancelled when the view disappears (e.g. navigation push,
-    /// fullScreenCover). Use `onEventLifeCycle` if you need events while the view is covered.
+    ///
+    /// Uses SwiftUI's `.task` lifecycle — the stream is cancelled when the view
+    /// disappears (e.g. navigation push, `fullScreenCover`). Use
+    /// ``onEventLifeCycle(_:bus:perform:)`` if you need events while the view
+    /// is covered but still in the hierarchy.
     func onEvent<T: Event>(
         _ type: T.Type,
         bus: EventBus = .shared,
@@ -19,7 +22,7 @@ public extension View {
         }
     }
 
-    /// Publishes an event derived from `value` whenever it changes.
+    /// Publishes an event derived from `value` whenever `value` changes.
     func onChangeOfEmitEvent<V: Equatable>(
         of value: V,
         bus: EventBus = .shared,
@@ -30,35 +33,34 @@ public extension View {
         }
     }
 
-    /// Immediately publishes `value` to the bus.
+    /// Immediately publishes `value` to `bus`.
     func emitEvent<V: Event>(of value: V, bus: EventBus = .shared) {
         Task { await bus.publish(value) }
     }
 
     /// Listens for events tied to the view's full lifecycle — not its visibility.
     ///
-    /// Unlike `onEvent` (which uses `.task` and cancels on `onDisappear`), this
-    /// keeps the stream alive as long as the view remains in the hierarchy, even
-    /// when it is covered by a `fullScreenCover`, a navigation push, or any
-    /// transition that triggers `onDisappear` without actually removing the view.
+    /// Unlike ``onEvent(_:bus:perform:)``, this keeps the stream alive as long as the
+    /// view remains in the hierarchy, even when covered by a `fullScreenCover`,
+    /// a navigation push, or any other transition that triggers `onDisappear`.
     /// The stream is cancelled only when the view is truly deallocated.
     func onEventLifeCycle<T: Event>(
         _ type: T.Type,
         bus: EventBus = .shared,
         perform: @escaping @Sendable (T) -> Void
     ) -> some View {
-        modifier(LifeCycleEventModifier(type: type, bus: bus, perform: perform))
+        modifier(EventLifecycleModifier(type: type, bus: bus, perform: perform))
     }
 }
 
-// MARK: - LifeCycleEventModifier
+// MARK: - EventLifecycleModifier
 
-private struct LifeCycleEventModifier<T: Event>: ViewModifier {
+private struct EventLifecycleModifier<T: Event>: ViewModifier {
 
-    @StateObject private var holder: EventStreamHolder<T>
+    @StateObject private var streamTask: EventStreamTask<T>
 
     init(type: T.Type, bus: EventBus, perform: @escaping @Sendable (T) -> Void) {
-        _holder = StateObject(wrappedValue: EventStreamHolder(type: type, bus: bus, perform: perform))
+        _streamTask = StateObject(wrappedValue: EventStreamTask(type: type, bus: bus, perform: perform))
     }
 
     func body(content: Content) -> some View {
@@ -66,22 +68,21 @@ private struct LifeCycleEventModifier<T: Event>: ViewModifier {
     }
 }
 
-// MARK: - EventStreamHolder
+// MARK: - EventStreamTask
 
-/// Owns the background streaming task. Because it is a `@StateObject`, SwiftUI
-/// keeps exactly one instance alive for the lifetime of the view in the hierarchy —
-/// not just while the view is visible. The task is cancelled only in `deinit`.
+/// Owns the background streaming task for ``EventLifecycleModifier``.
+///
+/// As a `@StateObject`, SwiftUI keeps exactly one instance alive for the view's full
+/// hierarchy lifetime — not just while the view is visible. The task is cancelled
+/// only in `deinit`, so events are received even when the view is temporarily covered.
 @MainActor
-private final class EventStreamHolder<T: Event>: ObservableObject {
+private final class EventStreamTask<T: Event>: ObservableObject {
 
     private var task: Task<Void, Never>?
 
     init(type: T.Type, bus: EventBus, perform: @escaping @Sendable (T) -> Void) {
-        let type = type
-        let bus  = bus
-        task = Task { [weak self] in
+        task = Task {
             for await event in await bus.stream(type) {
-                guard self != nil else { break }
                 perform(event)
             }
         }

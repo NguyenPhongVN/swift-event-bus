@@ -231,10 +231,10 @@ final class EventBusTests: XCTestCase {
         XCTAssertEqual(received.value?.username, "Alice")
     }
 
-    func testRemoveAllMiddlewares() async {
+    func testRemoveAllMiddleware() async {
         await bus.use(AppendMiddleware("_A"))
         await bus.use(AsyncAppendMiddleware("_B"))
-        await bus.removeAllMiddlewares()
+        await bus.removeAllMiddleware()
 
         let exp = expectation(description: "received original event")
         let received = Ref<LoginEvent?>(nil)

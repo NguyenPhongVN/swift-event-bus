@@ -1,447 +1,375 @@
 # EventBus
 
-Type-safe event bus for Swift with one shared surface across:
+A lightweight, type-safe event bus for Swift — with full support for async/await, Combine, and SwiftUI.
 
-- closure subscriptions
-- async/await one-shot waits
-- `AsyncStream`
-- Combine
-- SwiftUI property wrappers and view helpers
+[![CI](https://github.com/your-org/swift-event-bus/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/swift-event-bus/actions)
+![Swift 6](https://img.shields.io/badge/Swift-6-orange)
+![Platforms](https://img.shields.io/badge/platforms-iOS%2017%20·%20macOS%2015%20·%20tvOS%2017%20·%20watchOS%2010%20·%20visionOS%201-blue)
+
+---
+
+## Overview
+
+`EventBus` decouples components through a publish-subscribe pattern. One part of your app publishes an event; any number of other parts react — with no direct dependency between them.
+
+```swift
+// 1. Define an event
+struct UserLoggedIn: Event {
+    let username: String
+}
+
+// 2. Subscribe anywhere
+for await event in await EventBus.shared.stream(UserLoggedIn.self) {
+    print("Welcome,", event.username)
+}
+
+// 3. Publish anywhere
+await EventBus.shared.publish(UserLoggedIn(username: "An"))
+```
+
+Choose the subscription style that fits each use site:
+
+| Style | API | Best for |
+|---|---|---|
+| Closure | `on` / `off` | ViewModels, imperative code |
+| Async/await | `next(_:)`, `stream(_:)` | Swift Concurrency tasks |
+| Combine | `subscribe(_:)` | Existing Combine pipelines |
+| SwiftUI | `@EventListener`, `@EventPublisher`, `.onEvent` | Views and property wrappers |
+
+---
 
 ## Installation
 
+Add the package in `Package.swift`:
+
 ```swift
 dependencies: [
-    .package(url: "https://github.com/your-org/swift-event-bus.git", from: "0.1.0")
+    .package(url: "https://github.com/NguyenPhongVN/swift-event-bus", from: "0.1.0")
+],
+targets: [
+    .target(
+        name: "MyApp",
+        dependencies: [.product(name: "EventBus", package: "swift-event-bus")]
+    )
 ]
 ```
 
-```swift
-.target(
-    name: "MyApp",
-    dependencies: [
-        .product(name: "EventBus", package: "swift-event-bus")
-    ]
-)
-```
+---
 
-## Define Events
+## Quick Start
+
+### 1 — Define Events
+
+Any `struct`, `enum`, or `class` conforming to `Event` can be published. Because `Event` inherits from `Sendable`, all stored properties must also be `Sendable`.
 
 ```swift
 import EventBus
 
-struct LoginEvent: Event {
-    let username: String
+struct CartUpdated: Event {
+    let itemCount: Int
+    let totalPrice: Decimal
 }
 
-struct LogoutEvent: Event {
-    let userID: Int
-}
-
-struct CounterEvent: Event {
-    let value: Int
+struct OrderPlaced: Event {
+    let orderId: String
 }
 ```
 
-## Create a Bus
+> Prefer `struct`. Value types are `Sendable` by default when all their properties are `Sendable`.
 
-Use the shared singleton:
+### 2 — Create a Bus
 
 ```swift
+// App-wide singleton
 let bus = EventBus.shared
+
+// Feature-scoped instance (pass via dependency injection)
+let checkoutBus = EventBus()
+
+// Custom replay buffer (default: 100 events per type)
+let bus = EventBus(replayBufferLimit: 50)
 ```
 
-Or scope a bus to one feature:
+### 3 — Publish
 
 ```swift
-let bus = EventBus()
+// From an async context
+await bus.publish(CartUpdated(itemCount: 3, totalPrice: 49.99))
+
+// From a synchronous context
+Task { await bus.publish(OrderPlaced(orderId: "ORD-001")) }
 ```
 
-You can also configure replay buffer capacity:
+---
+
+## Subscription Styles
+
+### Closure
 
 ```swift
-let bus = EventBus(replayBufferLimit: 200)
-```
-
-## Publish Events
-
-```swift
-await bus.publish(LoginEvent(username: "an"))
-await bus.publish(CounterEvent(value: 1))
-```
-
-## Closure API
-
-Basic subscribe/unsubscribe:
-
-```swift
-let id = await bus.on(LoginEvent.self) { event in
-    print("login:", event.username)
+let id = await bus.on(CartUpdated.self) { event in
+    print("Cart:", event.itemCount, "items")
 }
 
-await bus.publish(LoginEvent(username: "an"))
-await bus.off(LoginEvent.self, id: id)
+// Remove later
+await bus.off(CartUpdated.self, id: id)
+
+// Remove all handlers for a type
+await bus.unsubscribeAll(for: CartUpdated.self)
 ```
 
-Remove every closure handler for one event type:
+**Auto-unsubscribe after N deliveries:**
 
 ```swift
-await bus.unsubscribeAll(for: LoginEvent.self)
-```
-
-Auto-unsubscribe after `N` deliveries:
-
-```swift
-await bus.on(CounterEvent.self, limit: 3) { event in
-    print("only first 3 events:", event.value)
+await bus.on(OrderPlaced.self, limit: 1) { event in
+    showConfirmation(for: event.orderId)   // fires once, then removed automatically
 }
 ```
 
-Priority ordering:
+**Priority ordering** (high → normal → low, registration order within same priority):
 
 ```swift
-await bus.on(LoginEvent.self, priority: .high) { _ in
-    print("runs first")
-}
-
-await bus.on(LoginEvent.self, priority: .normal) { _ in
-    print("runs after high")
-}
-
-await bus.on(LoginEvent.self, priority: .low) { _ in
-    print("runs last")
-}
+await bus.on(OrderPlaced.self, priority: .high)   { _ in validateInventory() }
+await bus.on(OrderPlaced.self, priority: .normal) { _ in sendConfirmationEmail() }
+await bus.on(OrderPlaced.self, priority: .low)    { _ in updateAnalytics() }
 ```
 
-Stable registration id:
+### Async/Await — One-Shot
+
+`next(_:)` suspends until the next matching event arrives, then returns. Throws `CancellationError` if the task is cancelled first.
 
 ```swift
-let fixedID = UUID()
-await bus.on(LoginEvent.self, id: fixedID) { _ in
-    print("custom id")
-}
+let event = try await bus.next(OrderPlaced.self)
+print("Order confirmed:", event.orderId)
 ```
 
-## One-Shot Async API
-
-Wait for the next matching event:
+**Race two event types** — returns as soon as the first one arrives:
 
 ```swift
-let login = try await bus.next(LoginEvent.self)
-print(login.username)
+let (login, guest) = try await bus.waitForAny(UserLoggedIn.self, GuestSessionStarted.self)
 ```
 
-If the waiting task is cancelled, `next(_:)` throws `CancellationError`.
-
-Legacy suspend-forever behavior:
+**Collect both event types** — waits until one of each has arrived:
 
 ```swift
-let login = await bus.nextOrSuspend(LoginEvent.self)
-```
-
-Wait until one of two event types arrives first:
-
-```swift
-let result = try await bus.waitForAny(LoginEvent.self, LogoutEvent.self)
-
-if let login = result.0 {
-    print("login:", login.username)
-}
-
-if let logout = result.1 {
-    print("logout:", logout.userID)
-}
-```
-
-Wait until both event types have arrived:
-
-```swift
-let (login, logout) = try await bus.waitForAll(
-    LoginEvent.self,
-    LogoutEvent.self,
-    timeout: .seconds(5)
+let (profile, settings) = try await bus.waitForAll(
+    ProfileLoaded.self,
+    SettingsLoaded.self,
+    timeout: .seconds(5)   // throws EventBusTimeoutError if deadline passes
 )
 ```
 
-If the timeout expires, the API throws `EventBusTimeoutError`.
+### Async/Await — Stream
 
-## AsyncStream API
-
-Basic stream:
+`stream(_:)` returns an `AsyncStream<T>` that yields every matching event until the task is cancelled or `reset()` is called.
 
 ```swift
-let stream = await bus.stream(CounterEvent.self)
-
-for await event in stream {
-    print(event.value)
+let task = Task {
+    for await event in await bus.stream(CartUpdated.self) {
+        updateBadge(count: event.itemCount)
+    }
 }
+
+// Unsubscribe
+task.cancel()
 ```
 
-Replay the last `N` events to new subscribers:
+**Stream operators:**
 
 ```swift
-let replayed = await bus.stream(CounterEvent.self, replay: 5)
+// Replay last N events to new subscribers
+await bus.stream(CartUpdated.self, replay: 5)
+
+// Filter — only yield events matching a predicate
+await bus.stream(OrderPlaced.self, filter: { $0.orderId.hasPrefix("ORD") })
+
+// Map — transform each event into another type
+await bus.stream(UserLoggedIn.self, map: \.username)   // → AsyncStream<String>
+
+// Debounce — emit only after the given silence interval
+await bus.stream(SearchQueryChanged.self, debounce: .milliseconds(300))
+
+// Throttle — at most one event per interval window
+await bus.stream(LocationUpdated.self, throttle: .seconds(1), latest: true)
 ```
 
-Filter:
-
-```swift
-let positives = await bus.stream(CounterEvent.self, filter: { event in
-    event.value > 0
-})
-```
-
-```swift
-for await event in positives {
-    print(event.value)
-}
-```
-
-Map:
-
-```swift
-let usernames = await bus.stream(LoginEvent.self, map: { event in
-    event.username.uppercased()
-})
-
-for await username in usernames {
-    print(username)
-}
-```
-
-Debounce:
-
-```swift
-let debounced = await bus.stream(CounterEvent.self, debounce: .milliseconds(300))
-```
-
-Throttle:
-
-```swift
-let throttled = await bus.stream(
-    CounterEvent.self,
-    throttle: .seconds(1),
-    latest: true
-)
-```
-
-## Combine API
+### Combine
 
 ```swift
 import Combine
 
 var cancellables = Set<AnyCancellable>()
 
-await bus.subscribe(LoginEvent.self)
-    .sink { event in
-        print(event.username)
-    }
+await bus.subscribe(UserLoggedIn.self)
+    .map(\.username)
+    .sink { print("Login:", $0) }
     .store(in: &cancellables)
 ```
 
+The publisher completes when `reset()` is called. The underlying subject is removed automatically when all subscribers cancel.
+
+---
+
 ## Middleware
 
-Synchronous middleware:
+Middleware intercepts every published event before it reaches subscribers. Return `nil` to drop the event, return the original to pass it through, or return a mutated copy to transform it. Middlewares execute in registration order.
 
 ```swift
-final class PrefixMiddleware: EventMiddleware {
+// Synchronous middleware
+final class LoggingMiddleware: EventMiddleware {
     func process(_ event: any Event) -> (any Event)? {
-        guard let login = event as? LoginEvent else { return event }
-        return LoginEvent(username: "prefix-" + login.username)
-    }
-}
-```
-
-Async middleware:
-
-```swift
-final class AuthMiddleware: AsyncEventMiddleware {
-    func process(_ event: any Event) async -> (any Event)? {
-        // validate, enrich, or drop
+        print("[Event]", type(of: event))
         return event
     }
 }
-```
 
-Register:
+// Async middleware — can await remote calls
+final class AuthMiddleware: AsyncEventMiddleware {
+    func process(_ event: any Event) async -> (any Event)? {
+        guard event is PurchaseEvent else { return event }
+        let authorized = await authService.validate()
+        return authorized ? event : nil   // drop if unauthorized
+    }
+}
+```
 
 ```swift
-let sync = PrefixMiddleware()
-let async = AuthMiddleware()
+await bus.use(LoggingMiddleware())
+await bus.use(AuthMiddleware(authService: authService))
 
-await bus.use(sync)
-await bus.use(async)
+// Remove specific middleware
+await bus.remove(loggingMiddleware)
+
+// Remove all
+await bus.removeAllMiddleware()
 ```
 
-Remove one middleware:
-
-```swift
-await bus.remove(sync)
-await bus.remove(async)
-```
-
-Remove all middlewares:
-
-```swift
-await bus.removeAllMiddlewares()
-```
-
-Debug logger:
+**Built-in debug logger** (no-op in Release builds):
 
 ```swift
 await bus.use(EventLogger())
 ```
 
-`EventLogger` only prints in `DEBUG`.
+---
 
-## Metrics
+## SwiftUI
+
+### Environment Injection
+
+Scope a bus to a view subtree so all descendants use it automatically:
 
 ```swift
-let metrics = await bus.metrics
-
-print(metrics.totalPublished)
-print(metrics.totalDroppedByMiddleware)
-print(metrics.activeStreams)
-print(metrics.activeHandlers)
-print(metrics.activeOneshotHandlers)
+CheckoutView()
+    .eventBus(checkoutBus)
 ```
 
-## Reset
+### @EventListener
 
-Reset clears:
-
-- Combine subjects
-- closure handlers
-- one-shot waiters
-- active streams
-- replay buffers
+Observes the latest event and triggers a view re-render on each new arrival. Supports `@dynamicMemberLookup` so you can access event properties directly:
 
 ```swift
-await bus.reset()
-```
-
-## EventBus Action Helper
-
-Useful for SwiftUI button actions:
-
-```swift
-let action = bus.action { LoginEvent(username: "an") }
-action()
-```
-
-Or directly in a button:
-
-```swift
-Button("Login", action: bus.action { LoginEvent(username: "an") })
-```
-
-## SwiftUI Property Wrappers
-
-Inject a bus into the view tree:
-
-```swift
-RootView()
-    .eventBus(bus)
-```
-
-Listen to the latest event:
-
-```swift
-struct ContentView: View {
-    @EventListener(LoginEvent.self) private var login
+struct ProfileHeader: View {
+    @EventListener(UserLoggedIn.self) var login
 
     var body: some View {
-        Text(login.username ?? "guest")
+        // login.username is shorthand for login.value?.username
+        Text(login.username ?? "Guest")
     }
 }
 ```
 
-Use an explicit bus instead of environment:
+`EventListenerStorage` also exposes the full event history:
 
 ```swift
-@EventListener(LoginEvent.self, bus: customBus) private var login
+login.value      // T? — most recent event
+login.history    // [T] — all received events
+login.count      // Int — history.count
+login.reset()    // clears value and history without stopping the stream
 ```
 
-`EventListenerStorage` also exposes:
+### @EventPublisher
+
+Publishes events from a view. Reads the bus from the environment automatically:
 
 ```swift
-login.value
-login.history
-login.count
-login.reset()
-```
-
-Publish from SwiftUI:
-
-```swift
-struct LoginButton: View {
+struct CheckoutButton: View {
     @EventPublisher private var publish
 
     var body: some View {
-        Button("Login") {
-            publish(LoginEvent(username: "an"))
+        Button("Place Order") {
+            publish(OrderPlaced(orderId: "ORD-001"))
         }
     }
 }
 ```
 
-Use explicit bus:
+Or use `action(_:)` directly in a `Button`:
 
 ```swift
-@EventPublisher(bus: customBus) private var publish
+Button("Login", action: bus.action { UserLoggedIn(username: "An") })
 ```
 
-Call through projected value:
+### View Modifiers
 
 ```swift
-$publish(LoginEvent(username: "an"))
+// Tied to view visibility — pauses when view is covered by fullScreenCover or navigation push
+.onEvent(CartUpdated.self) { event in
+    updateBadge(count: event.itemCount)
+}
+
+// Tied to view lifetime — keeps receiving events even when the view is temporarily hidden
+.onEventLifeCycle(OrderPlaced.self) { event in
+    showNotification(for: event)
+}
+
+// Publish an event whenever a value changes
+TextField("Search", text: $query)
+    .onChangeOfEmitEvent(of: query) { SearchQueryChanged(query: $0) }
 ```
 
-## SwiftUI View Helpers
+| Modifier | Stream lifetime |
+|---|---|
+| `.onEvent` | View visible (`.task` lifecycle) |
+| `.onEventLifeCycle` | View in hierarchy (`deinit`) |
 
-Listen while the view's `.task` is active:
+---
+
+## Diagnostics
 
 ```swift
-Text("Counter")
-    .onEvent(CounterEvent.self, bus: bus) { event in
-        print(event.value)
-    }
+let metrics = await bus.metrics
+
+metrics.totalPublished           // total events through publish(_:)
+metrics.totalDroppedByMiddleware // events dropped by middleware
+metrics.activeStreams             // live AsyncStream subscriptions
+metrics.activeHandlers           // registered closure handlers
+metrics.activeOneshotHandlers    // pending next(_:) waiters
 ```
 
-Listen across the view lifecycle, not just visible state:
+**Reset** — clears all subscribers, closes all streams, and empties replay buffers:
 
 ```swift
-Text("Counter")
-    .onEventLifeCycle(CounterEvent.self, bus: bus) { event in
-        print(event.value)
-    }
+await bus.reset()
+// Active for-await loops exit cleanly.
+// Pending next(_:) calls throw CancellationError.
 ```
 
-Publish when a value changes:
-
-```swift
-TextField("Username", text: $username)
-    .onChangeOfEmitEvent(of: username, bus: bus) { value in
-        LoginEvent(username: value)
-    }
-```
-
-Publish immediately:
-
-```swift
-someView.emitEvent(of: LoginEvent(username: "an"), bus: bus)
-```
+---
 
 ## Platform Support
 
-| Platform | Minimum |
-| --- | --- |
+| Platform | Minimum version |
+|---|---|
 | iOS | 17.0 |
 | macOS | 15.0 |
 | tvOS | 17.0 |
 | watchOS | 10.0 |
 | visionOS | 1.0 |
 
+Requires **Swift 6** with strict concurrency enabled.
+
+---
+
 ## License
 
-The repository does not include a license file yet.
+MIT — see [LICENSE](LICENSE).
