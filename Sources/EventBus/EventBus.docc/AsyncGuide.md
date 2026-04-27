@@ -36,7 +36,7 @@ Task {
 
 ### next(_:) vs nextOrSuspend(_:)
 
-``EventBus/nextOrSuspend(_:)`` is a non-throwing variant that ignores cancellation — the caller stays suspended until a matching event arrives or ``EventBus/reset()`` is called. Use it only when you are certain the surrounding context will always receive the event:
+``EventBus/nextOrSuspend(_:)`` is a non-throwing variant that ignores cancellation. Use it only when you are certain the surrounding context will always receive the event:
 
 ```swift
 // Never throws — caller blocks indefinitely

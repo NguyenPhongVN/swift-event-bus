@@ -1,5 +1,6 @@
 import SwiftUI
 @preconcurrency import Combine
+import OSLog
 
 // MARK: - EventBus
 
@@ -26,13 +27,22 @@ public actor EventBus {
     ///
     /// - Parameter replayBufferLimit: Maximum events per type stored for replay.
     ///   Pass `0` to disable replay. Defaults to `100`.
-    public init(replayBufferLimit: Int = 100) {
+    public init(
+        replayBufferLimit: Int = 100,
+        observability: EventBusObservability = .default
+    ) {
         self.replayBufferLimit = max(0, replayBufferLimit)
+        self.logger = Logger(subsystem: observability.subsystem, category: observability.category)
+        self.signposter = observability.signpostsEnabled
+            ? OSSignposter(logger: logger)
+            : nil
     }
 
     // MARK: Private Storage
 
     private let replayBufferLimit: Int
+    private let logger: Logger
+    private let signposter: OSSignposter?
     private var subjects:                [ObjectIdentifier: Any] = [:]
     private var subjectFinishers:        [ObjectIdentifier: @Sendable () -> Void] = [:]
     private var subjectSubscriberCounts: [ObjectIdentifier: Int] = [:]
@@ -88,6 +98,11 @@ public actor EventBus {
         middlewares.removeAll()
     }
 
+    /// Backward-compatible alias with the original plural name.
+    public func removeAllMiddlewares() {
+        removeAllMiddleware()
+    }
+
     // MARK: Publish
 
     /// Broadcasts `event` to all current subscribers of type `T`.
@@ -96,6 +111,12 @@ public actor EventBus {
     /// returns `nil`, the event is silently dropped and no subscriber is notified.
     public func publish<T: Event>(_ event: T) async {
         publishCount += 1
+        let signpostState = signposter?.beginInterval("Publish")
+        defer {
+            if let signposter, let signpostState {
+                signposter.endInterval("Publish", signpostState)
+            }
+        }
 
         var current: (any Event)? = event
         for middleware in middlewares {
@@ -105,7 +126,9 @@ public actor EventBus {
 
         guard let resolved = current as? T else {
             if current != nil {
-                print("[EventBus] ⚠️ Middleware changed event type — dropped \(type(of: event))")
+                logger.warning(
+                    "Dropped event after middleware changed type from \(String(describing: T.self), privacy: .public)"
+                )
             }
             dropCount += 1
             return
@@ -164,7 +187,7 @@ public actor EventBus {
         id: UUID = UUID(),
         handler: @escaping @Sendable (T) -> Void
     ) -> UUID {
-        registerHandler(type, priority: priority, limit: nil, id: id, handler: handler)
+        registerHandler(type, priority: priority, limit: nil, id: id, owner: nil, handler: handler)
     }
 
     /// Registers a closure handler that fires at most `limit` times, then auto-unregisters.
@@ -184,7 +207,45 @@ public actor EventBus {
         id: UUID = UUID(),
         handler: @escaping @Sendable (T) -> Void
     ) -> UUID {
-        registerHandler(type, priority: priority, limit: max(0, limit), id: id, handler: handler)
+        registerHandler(type, priority: priority, limit: max(0, limit), id: id, owner: nil, handler: handler)
+    }
+
+    /// Registers a closure handler tied to the lifetime of `owner`.
+    ///
+    /// Once `owner` is deallocated, the handler is automatically removed the next time
+    /// an event of `T` is dispatched.
+    @discardableResult
+    @preconcurrency
+    public func on<T: Event, Owner: AnyObject>(
+        _ type: T.Type,
+        owner: Owner,
+        priority: EventPriority = .normal,
+        id: UUID = UUID(),
+        handler: @escaping @Sendable (Owner, T) -> Void
+    ) -> UUID {
+        let weakOwner = WeakOwnerBox(owner)
+        return registerHandler(type, priority: priority, limit: nil, id: id, owner: weakOwner) { event in
+            guard let owner = weakOwner.value as? Owner else { return }
+            handler(owner, event)
+        }
+    }
+
+    /// Registers a limited handler tied to the lifetime of `owner`.
+    @discardableResult
+    @preconcurrency
+    public func on<T: Event, Owner: AnyObject>(
+        _ type: T.Type,
+        owner: Owner,
+        limit: Int,
+        priority: EventPriority = .normal,
+        id: UUID = UUID(),
+        handler: @escaping @Sendable (Owner, T) -> Void
+    ) -> UUID {
+        let weakOwner = WeakOwnerBox(owner)
+        return registerHandler(type, priority: priority, limit: max(0, limit), id: id, owner: weakOwner) { event in
+            guard let owner = weakOwner.value as? Owner else { return }
+            handler(owner, event)
+        }
     }
 
     /// Unregisters the handler identified by `id` for events of type `T`.
@@ -454,6 +515,7 @@ public actor EventBus {
         priority: EventPriority,
         limit: Int?,
         id: UUID,
+        owner: WeakOwnerBox?,
         handler: @escaping @Sendable (T) -> Void
     ) -> UUID {
         let key = ObjectIdentifier(type)
@@ -462,6 +524,7 @@ public actor EventBus {
             priority:  priority,
             sequence:  nextSequence,
             remaining: limit,
+            owner: owner,
             handler:   { event in if let typed = event as? T { handler(typed) } }
         )
         return id
@@ -477,6 +540,10 @@ public actor EventBus {
         }
 
         for (id, entry) in ordered {
+            if entry.owner?.value == nil, entry.owner != nil {
+                handlers[key]?[id] = nil
+                continue
+            }
             entry.handler(event)
             guard var updated = handlers[key]?[id], let remaining = updated.remaining else { continue }
             let next = remaining - 1
@@ -580,4 +647,3 @@ public extension EventBus {
         { [self] in Task { await self.publish(make()) } }
     }
 }
-

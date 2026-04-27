@@ -1,6 +1,6 @@
 # ``EventBus``
 
-A lightweight, type-safe event bus for Swift apps, with full support for async/await, Combine, and SwiftUI.
+A lightweight, type-safe event bus for Swift apps, with full support for async/await, Combine, SwiftUI, weak owner cleanup, and production observability.
 
 ## Overview
 
@@ -61,6 +61,7 @@ let checkoutBus = EventBus()
 
 - ``EventBus/shared``
 - ``EventBus/init(replayBufferLimit:)``
+- ``EventBus/init(replayBufferLimit:observability:)``
 
 ### Publishing
 
@@ -71,6 +72,8 @@ let checkoutBus = EventBus()
 
 - ``EventBus/on(_:priority:id:handler:)``
 - ``EventBus/on(_:limit:priority:id:handler:)``
+- ``EventBus/on(_:owner:priority:id:handler:)``
+- ``EventBus/on(_:owner:limit:priority:id:handler:)``
 - ``EventBus/off(_:id:)``
 - ``EventBus/unsubscribeAll(for:)``
 - ``EventPriority``
@@ -105,6 +108,7 @@ let checkoutBus = EventBus()
 - ``EventBus/remove(_:)-6xkqp``
 - ``EventBus/remove(_:)-2b8ej``
 - ``EventBus/removeAllMiddleware()``
+- ``EventBus/removeAllMiddlewares()``
 
 ### SwiftUI
 
@@ -116,6 +120,7 @@ let checkoutBus = EventBus()
 
 - ``EventBus/metrics``
 - ``EventBusMetrics``
+- ``EventBusObservability``
 - ``EventBus/reset()``
 
 ### Errors

@@ -105,7 +105,7 @@ await bus.publish(MessageEvent(text: "hello"))
 
 ## Built-In Middleware
 
-``EventLogger`` is a ready-made debug middleware that prints every event to the console. It is a no-op in release builds:
+``EventLogger`` is a ready-made debug middleware that writes every event through `os.Logger`. It is a no-op in release builds:
 
 ```swift
 await bus.use(EventLogger())

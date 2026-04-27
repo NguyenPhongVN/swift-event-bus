@@ -1,0 +1,59 @@
+name: DocC
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build-docs:
+    runs-on: macos-15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          XCODE=$(ls /Applications | grep -E "^Xcode_[0-9]" | sort -V | tail -1)
+          if [ -n "$XCODE" ]; then
+            sudo xcode-select -s "/Applications/$XCODE"
+          fi
+          swift --version
+
+      - name: Build DocC archive
+        run: |
+          xcodebuild docbuild \
+            -scheme EventBus-Package \
+            -destination "generic/platform=iOS"
+
+      - name: Transform for static hosting
+        run: |
+          ARCHIVE=$(find ~/Library/Developer/Xcode/DerivedData -name "EventBus.doccarchive" | head -1)
+          xcrun docc process-archive transform-for-static-hosting \
+            "$ARCHIVE" \
+            --output-path docs \
+            --hosting-base-path swift-event-bus
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

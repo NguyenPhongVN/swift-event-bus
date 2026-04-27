@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 // MARK: - Event
 
@@ -21,16 +22,25 @@ public protocol AsyncEventMiddleware: AnyObject, Sendable {
     func process(_ event: any Event) async -> (any Event)?
 }
 
-/// Debug-only middleware that prints every event to the console.
+/// Debug-only middleware that writes every event to unified logging.
 ///
 /// Marked `@unchecked Sendable` because the class carries no mutable state;
 /// it is effectively immutable after `init()`.
 public final class EventLogger: EventMiddleware, @unchecked Sendable {
-    public init() {}
+    private let logger: Logger
+
+    public init(
+        subsystem: String = "EventBus",
+        category: String = "Events"
+    ) {
+        self.logger = Logger(subsystem: subsystem, category: category)
+    }
 
     public func process(_ event: any Event) -> (any Event)? {
 #if DEBUG
-        print("[EventBus] \(type(of: event)) — \(event)")
+        logger.debug(
+            "\(String(describing: type(of: event)), privacy: .public) \(String(describing: event), privacy: .public)"
+        )
 #endif
         return event
     }
@@ -66,6 +76,26 @@ public struct EventBusMetrics: Sendable {
     public let activeOneshotHandlers: Int
 }
 
+/// Configures runtime logging and signpost emission for ``EventBus``.
+public struct EventBusObservability: Sendable {
+    public let subsystem: String
+    public let category: String
+    public let signpostsEnabled: Bool
+
+    public init(
+        subsystem: String = "EventBus",
+        category: String = "Runtime",
+        signpostsEnabled: Bool = false
+    ) {
+        self.subsystem = subsystem
+        self.category = category
+        self.signpostsEnabled = signpostsEnabled
+    }
+
+    public static let `default` = EventBusObservability()
+    public static let signposted = EventBusObservability(signpostsEnabled: true)
+}
+
 /// Thrown by ``EventBus/waitForAll(_:_:timeout:)`` when the deadline elapses
 /// before all expected events arrive.
 public struct EventBusTimeoutError: Error, Sendable {
@@ -83,6 +113,7 @@ internal struct HandlerEntry: Sendable {
     let priority:  EventPriority
     let sequence:  Int
     var remaining: Int?
+    let owner: WeakOwnerBox?
     let handler:   @Sendable (any Event) -> Void
 }
 
@@ -110,6 +141,14 @@ internal enum MiddlewareEntry {
     func matches(_ mw: any AsyncEventMiddleware) -> Bool {
         guard case .async(let stored) = self else { return false }
         return stored === mw
+    }
+}
+
+internal final class WeakOwnerBox: @unchecked Sendable {
+    weak var value: AnyObject?
+
+    init(_ value: AnyObject) {
+        self.value = value
     }
 }
 

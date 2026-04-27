@@ -7,6 +7,7 @@ import XCTest
 private struct LoginEvent:   Event { let username: String }
 private struct LogoutEvent:  Event { let userId:   Int    }
 private struct CounterEvent: Event { let value:    Int    }
+private struct TokenEvent:   Event { let token:    String }
 
 // MARK: - Test Middleware
 
@@ -38,6 +39,16 @@ private final class AsyncAppendMiddleware: AsyncEventMiddleware {
         guard let e = event as? LoginEvent else { return event }
         return LoginEvent(username: e.username + suffix)
     }
+}
+
+private final class WrongTypeMiddleware: EventMiddleware {
+    func process(_ event: any Event) -> (any Event)? {
+        LogoutEvent(userId: 404)
+    }
+}
+
+private final class OwnerProbe: @unchecked Sendable {
+    var callCount = 0
 }
 
 // MARK: - Helpers
@@ -247,6 +258,35 @@ final class EventBusTests: XCTestCase {
         XCTAssertEqual(received.value?.username, "Alice")
     }
 
+    func testRemoveAllMiddlewaresAlias() async {
+        await bus.use(AppendMiddleware("_A"))
+        await bus.removeAllMiddlewares()
+
+        let exp = expectation(description: "received original event")
+        let received = Ref<LoginEvent?>(nil)
+        await bus.on(LoginEvent.self) {
+            received.value = $0
+            exp.fulfill()
+        }
+        await bus.publish(LoginEvent(username: "Alice"))
+        await fulfillment(of: [exp], timeout: 1)
+        XCTAssertEqual(received.value?.username, "Alice")
+    }
+
+    func testMiddlewareChangedTypeDropsEventAndUpdatesMetrics() async {
+        await bus.use(WrongTypeMiddleware())
+        let called = Ref<Bool>(false)
+        await bus.on(LoginEvent.self) { _ in called.value = true }
+
+        await bus.publish(LoginEvent(username: "Alice"))
+        await drain()
+
+        let metrics = await bus.metrics
+        XCTAssertFalse(called.value)
+        XCTAssertEqual(metrics.totalPublished, 1)
+        XCTAssertEqual(metrics.totalDroppedByMiddleware, 1)
+    }
+
     // MARK: - Combine
 
     func testCombineSubscriberReceivesEvent() async {
@@ -395,6 +435,16 @@ final class EventBusTests: XCTestCase {
         XCTAssertEqual(result.username, "raw_mw")
     }
 
+    func testNextOrSuspendReturnsMatchingEvent() async {
+        let b = bus!
+        let task = Task { await b.nextOrSuspend(TokenEvent.self) }
+        await drain()
+
+        await bus.publish(TokenEvent(token: "abc"))
+        let result = await task.value
+        XCTAssertEqual(result.token, "abc")
+    }
+
     // MARK: - stream()
 
     func testStreamReceivesMultipleEventsInOrder() async {
@@ -519,6 +569,94 @@ final class EventBusTests: XCTestCase {
         await fulfillment(of: [exp], timeout: 1)
         task.cancel()
         XCTAssertEqual(received.value, "raw_mw")
+    }
+
+    func testStreamFilterOnlyYieldsMatchingEvents() async {
+        let b = bus!
+        let values = Ref<[Int]>([])
+        let exp = expectation(description: "filtered values")
+
+        let task = Task {
+            for await event in await b.stream(CounterEvent.self, filter: { $0.value > 1 }) {
+                values.value.append(event.value)
+                if values.value.count == 2 { exp.fulfill() }
+            }
+        }
+        await drain()
+
+        await bus.publish(CounterEvent(value: 1))
+        await bus.publish(CounterEvent(value: 2))
+        await bus.publish(CounterEvent(value: 3))
+
+        await fulfillment(of: [exp], timeout: 1)
+        task.cancel()
+        XCTAssertEqual(values.value, [2, 3])
+    }
+
+    func testStreamMapTransformsEvents() async {
+        let b = bus!
+        let values = Ref<[String]>([])
+        let exp = expectation(description: "mapped values")
+
+        let task = Task {
+            for await username in await b.stream(LoginEvent.self, map: { $0.username.uppercased() }) {
+                values.value.append(username)
+                if values.value.count == 2 { exp.fulfill() }
+            }
+        }
+        await drain()
+
+        await bus.publish(LoginEvent(username: "alice"))
+        await bus.publish(LoginEvent(username: "bob"))
+
+        await fulfillment(of: [exp], timeout: 1)
+        task.cancel()
+        XCTAssertEqual(values.value, ["ALICE", "BOB"])
+    }
+
+    func testStreamDebounceOnlyYieldsLatestBurstEvent() async {
+        let b = bus!
+        let values = Ref<[Int]>([])
+        let exp = expectation(description: "debounced value")
+
+        let task = Task {
+            for await event in await b.stream(CounterEvent.self, debounce: .milliseconds(40)) {
+                values.value.append(event.value)
+                exp.fulfill()
+            }
+        }
+        await drain()
+
+        await bus.publish(CounterEvent(value: 1))
+        try? await Task.sleep(for: .milliseconds(10))
+        await bus.publish(CounterEvent(value: 2))
+        try? await Task.sleep(for: .milliseconds(10))
+        await bus.publish(CounterEvent(value: 3))
+
+        await fulfillment(of: [exp], timeout: 1)
+        task.cancel()
+        XCTAssertEqual(values.value, [3])
+    }
+
+    func testStreamThrottleLatestYieldsLeadingAndTrailingEvent() async {
+        let b = bus!
+        let values = Ref<[Int]>([])
+        let exp = expectation(description: "throttled values")
+
+        let task = Task {
+            for await event in await b.stream(CounterEvent.self, throttle: .milliseconds(40), latest: true) {
+                values.value.append(event.value)
+                if values.value.count == 2 { exp.fulfill() }
+            }
+        }
+        await drain()
+
+        await bus.publish(CounterEvent(value: 1))
+        await bus.publish(CounterEvent(value: 2))
+
+        await fulfillment(of: [exp], timeout: 1)
+        task.cancel()
+        XCTAssertEqual(values.value, [1, 2])
     }
 
     // MARK: - reset()
@@ -752,6 +890,50 @@ final class EventBusTests: XCTestCase {
         let metrics = await bus.metrics
         XCTAssertEqual(metrics.totalPublished, 1)
         XCTAssertEqual(metrics.totalDroppedByMiddleware, 1)
+    }
+
+    func testMetricsTrackActiveRegistrations() async {
+        let b = bus!
+        let owner = OwnerProbe()
+        _ = await bus.on(LoginEvent.self, owner: owner) { owner, _ in
+            owner.callCount += 1
+        }
+        let nextTask = Task { try await b.next(TokenEvent.self) }
+        let streamTask = Task {
+            for await _ in await b.stream(CounterEvent.self) {
+                break
+            }
+        }
+        await drain()
+
+        let metrics = await bus.metrics
+        XCTAssertEqual(metrics.activeHandlers, 1)
+        XCTAssertEqual(metrics.activeOneshotHandlers, 1)
+        XCTAssertEqual(metrics.activeStreams, 1)
+
+        streamTask.cancel()
+        nextTask.cancel()
+    }
+
+    func testOwnerBoundHandlerAutoCleansAfterDeinit() async {
+        weak var weakOwner: OwnerProbe?
+        var owner: OwnerProbe? = OwnerProbe()
+        weakOwner = owner
+
+        await bus.on(LoginEvent.self, owner: owner!) { owner, _ in
+            owner.callCount += 1
+        }
+        await bus.publish(LoginEvent(username: "first"))
+        XCTAssertEqual(owner?.callCount, 1)
+
+        owner = nil
+        XCTAssertNil(weakOwner)
+
+        await bus.publish(LoginEvent(username: "second"))
+        await drain()
+
+        let metrics = await bus.metrics
+        XCTAssertEqual(metrics.activeHandlers, 0)
     }
 
     func testActionUsesCorrectBus() async {

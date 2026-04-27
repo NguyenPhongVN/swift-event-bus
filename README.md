@@ -1,6 +1,6 @@
 # EventBus
 
-A lightweight, type-safe event bus for Swift — with full support for async/await, Combine, and SwiftUI.
+A lightweight, type-safe event bus for Swift — with full support for async/await, Combine, SwiftUI, weak owner cleanup, and production observability.
 
 [![CI](https://github.com/your-org/swift-event-bus/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/swift-event-bus/actions)
 ![Swift 6](https://img.shields.io/badge/Swift-6-orange)
@@ -36,6 +36,13 @@ Choose the subscription style that fits each use site:
 | Combine | `subscribe(_:)` | Existing Combine pipelines |
 | SwiftUI | `@EventListener`, `@EventPublisher`, `.onEvent` | Views and property wrappers |
 
+Release assets included:
+
+- `CHANGELOG.md`
+- `.swiftlint.yml`
+- `.github/workflows/docc.yml`
+- `Examples/SwiftUIExample/`
+
 ---
 
 ## Installation
@@ -44,7 +51,7 @@ Add the package in `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/NguyenPhongVN/swift-event-bus", from: "0.1.0")
+    .package(url: "https://github.com/NguyenPhongVN/swift-event-bus", from: "1.0.0")
 ],
 targets: [
     .target(
@@ -88,6 +95,15 @@ let checkoutBus = EventBus()
 
 // Custom replay buffer (default: 100 events per type)
 let bus = EventBus(replayBufferLimit: 50)
+
+// Enable OSSignposter intervals for Instruments
+let observedBus = EventBus(
+    observability: .init(
+        subsystem: "com.example.checkout",
+        category: "Runtime",
+        signpostsEnabled: true
+    )
+)
 ```
 
 ### 3 — Publish
@@ -134,6 +150,21 @@ await bus.on(OrderPlaced.self, priority: .normal) { _ in sendConfirmationEmail()
 await bus.on(OrderPlaced.self, priority: .low)    { _ in updateAnalytics() }
 ```
 
+**Weak owner auto-cleanup**:
+
+```swift
+@MainActor
+final class CheckoutViewModel {
+    var completedOrders: [String] = []
+}
+
+let viewModel = CheckoutViewModel()
+
+await bus.on(OrderPlaced.self, owner: viewModel) { owner, event in
+    owner.completedOrders.append(event.orderId)
+}
+```
+
 ### Async/Await — One-Shot
 
 `next(_:)` suspends until the next matching event arrives, then returns. Throws `CancellationError` if the task is cancelled first.
@@ -141,6 +172,12 @@ await bus.on(OrderPlaced.self, priority: .low)    { _ in updateAnalytics() }
 ```swift
 let event = try await bus.next(OrderPlaced.self)
 print("Order confirmed:", event.orderId)
+```
+
+Use the non-throwing variant only when you deliberately want to suspend until an event arrives:
+
+```swift
+let event = await bus.nextOrSuspend(OrderPlaced.self)
 ```
 
 **Race two event types** — returns as soon as the first one arrives:
@@ -250,6 +287,8 @@ await bus.removeAllMiddleware()
 await bus.use(EventLogger())
 ```
 
+`EventLogger` writes through `os.Logger`, so event traces show up in the unified logging system instead of raw `print`.
+
 ---
 
 ## SwiftUI
@@ -346,6 +385,20 @@ metrics.activeHandlers           // registered closure handlers
 metrics.activeOneshotHandlers    // pending next(_:) waiters
 ```
 
+**Observability**:
+
+```swift
+let bus = EventBus(
+    observability: .init(
+        subsystem: "com.example.payments",
+        category: "EventBus",
+        signpostsEnabled: true
+    )
+)
+```
+
+When signposts are enabled, each `publish(_:)` emits an `OSSignposter` interval that can be inspected in Instruments.
+
 **Reset** — clears all subscribers, closes all streams, and empties replay buffers:
 
 ```swift
@@ -367,6 +420,12 @@ await bus.reset()
 | visionOS | 1.0 |
 
 Requires **Swift 6** with strict concurrency enabled.
+
+---
+
+## Example App
+
+See `Examples/SwiftUIExample/` for a minimal SwiftUI sample showing environment injection, `@EventListener`, `@EventPublisher`, and `.onEventLifeCycle`.
 
 ---
 
